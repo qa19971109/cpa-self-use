@@ -662,11 +662,22 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	})
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	upstreamStarted := time.Now()
+	helps.LogWithRequestID(ctx).Infof("codex stream executor: upstream request started | model=%s", baseModel)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		elapsed := time.Since(upstreamStarted).Round(time.Millisecond)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled before upstream headers | elapsed=%s err=%v context_err=%v", elapsed, err, ctxErr)
+		} else {
+			helps.LogWithRequestID(ctx).Warnf("codex stream executor: upstream request failed before headers | elapsed=%s err=%v", elapsed, err)
+		}
 		return nil, err
 	}
+	streamHeadersReceivedAt := time.Now()
+	headersElapsed := streamHeadersReceivedAt.Sub(upstreamStarted).Round(time.Millisecond)
+	helps.LogWithRequestID(ctx).Infof("codex stream executor: upstream headers received | status=%d elapsed=%s", httpResp.StatusCode, headersElapsed)
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := io.ReadAll(httpResp.Body)
@@ -698,11 +709,22 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
+				retryStarted := time.Now()
+				helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted_content retry upstream request started | model=%s", baseModel)
 				retryResp, retryErr := httpClient.Do(retryReq)
 				if retryErr != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
+					elapsed := time.Since(retryStarted).Round(time.Millisecond)
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled before retry upstream headers | elapsed=%s err=%v context_err=%v", elapsed, retryErr, ctxErr)
+					} else {
+						helps.LogWithRequestID(ctx).Warnf("codex stream executor: encrypted_content retry upstream request failed before headers | elapsed=%s err=%v", elapsed, retryErr)
+					}
 					return nil, retryErr
 				}
+				streamHeadersReceivedAt = time.Now()
+				retryHeadersElapsed := streamHeadersReceivedAt.Sub(retryStarted).Round(time.Millisecond)
+				helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted_content retry upstream headers received | status=%d elapsed=%s", retryResp.StatusCode, retryHeadersElapsed)
 				helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
 				if retryResp.StatusCode < 200 || retryResp.StatusCode >= 300 {
 					retryData, retryReadErr := io.ReadAll(retryResp.Body)
@@ -742,8 +764,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
+		firstUpstreamChunk := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			if !firstUpstreamChunk {
+				firstUpstreamChunk = true
+				helps.LogWithRequestID(ctx).Infof("codex stream executor: first upstream stream chunk received | since_headers=%s total_elapsed=%s bytes=%d", time.Since(streamHeadersReceivedAt).Round(time.Millisecond), time.Since(upstreamStarted).Round(time.Millisecond), len(line))
+			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			translatedLine := bytes.Clone(line)
 
@@ -755,6 +782,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 					case <-ctx.Done():
+						helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding terminal stream error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
 					}
 					return
 				}
@@ -776,6 +804,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 				case <-ctx.Done():
+					helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding stream chunk | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
 					return
 				}
 			}
@@ -783,10 +812,16 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.PublishFailure(ctx, errScan)
+			helps.LogWithRequestID(ctx).Warnf("codex stream executor: upstream stream read failed | first_chunk=%t total_elapsed=%s err=%v", firstUpstreamChunk, time.Since(upstreamStarted).Round(time.Millisecond), errScan)
 			select {
 			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
 			case <-ctx.Done():
+				helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding stream read error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
 			}
+			return
+		}
+		if !firstUpstreamChunk {
+			helps.LogWithRequestID(ctx).Infof("codex stream executor: upstream stream ended without chunks | total_elapsed=%s", time.Since(upstreamStarted).Round(time.Millisecond))
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
