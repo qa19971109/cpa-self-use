@@ -1,6 +1,13 @@
-FROM golang:1.26-alpine AS builder
+ARG GO_IMAGE=docker.1ms.run/library/golang:1.26-alpine
+ARG ALPINE_IMAGE=docker.1ms.run/library/alpine:3.23
+ARG GOPROXY=https://goproxy.cn,direct
+ARG ALPINE_REPO=https://mirrors.aliyun.com/alpine
+
+FROM ${GO_IMAGE} AS builder
 
 WORKDIR /app
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
 
 COPY go.mod go.sum ./
 
@@ -14,9 +21,10 @@ ARG BUILD_DATE=unknown
 
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM alpine:3.23
+FROM ${ALPINE_IMAGE}
 
-RUN apk add --no-cache tzdata
+ARG ALPINE_REPO
+RUN sed -i "s|https://dl-cdn.alpinelinux.org/alpine|${ALPINE_REPO}|g" /etc/apk/repositories && apk add --no-cache tzdata
 
 RUN mkdir /CLIProxyAPI
 
