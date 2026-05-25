@@ -874,7 +874,29 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
-		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
+		retriedAfterUnauthorizedRefresh := false
+		var streamResult *cliproxyexecutor.StreamResult
+		var errStream error
+	retryStreamAfterUnauthorizedRefresh:
+		for {
+			streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, opts)
+			if errStream == nil || !isUnauthorizedError(errStream) || retriedAfterUnauthorizedRefresh {
+				break
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				return nil, errCtx
+			}
+			refreshedAuth, refreshed, refreshErr := m.refreshAuthForUnauthorizedRetry(ctx, executor, auth)
+			if refreshErr != nil {
+				errStream = refreshErr
+				break
+			}
+			if !refreshed {
+				break
+			}
+			auth = refreshedAuth
+			retriedAfterUnauthorizedRefresh = true
+		}
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -898,6 +920,18 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
+			}
+			if isUnauthorizedError(bootstrapErr) && !retriedAfterUnauthorizedRefresh {
+				discardStreamChunks(streamResult.Chunks)
+				refreshedAuth, refreshed, refreshErr := m.refreshAuthForUnauthorizedRetry(ctx, executor, auth)
+				if refreshErr == nil && refreshed {
+					auth = refreshedAuth
+					retriedAfterUnauthorizedRefresh = true
+					goto retryStreamAfterUnauthorizedRefresh
+				}
+				if refreshErr != nil {
+					bootstrapErr = refreshErr
+				}
 			}
 			if isRequestInvalidError(bootstrapErr) {
 				rerr := &Error{Message: bootstrapErr.Error()}
@@ -1390,11 +1424,24 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			retriedAfterUnauthorizedRefresh := false
+		retryExecuteAfterUnauthorizedRefresh:
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
+				}
+				if isUnauthorizedError(errExec) && !retriedAfterUnauthorizedRefresh {
+					refreshedAuth, refreshed, refreshErr := m.refreshAuthForUnauthorizedRetry(execCtx, executor, auth)
+					if refreshErr == nil && refreshed {
+						auth = refreshedAuth
+						retriedAfterUnauthorizedRefresh = true
+						goto retryExecuteAfterUnauthorizedRefresh
+					}
+					if refreshErr != nil {
+						errExec = refreshErr
+					}
 				}
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -1489,11 +1536,24 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			retriedAfterUnauthorizedRefresh := false
+		retryCountAfterUnauthorizedRefresh:
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
+				}
+				if isUnauthorizedError(errExec) && !retriedAfterUnauthorizedRefresh {
+					refreshedAuth, refreshed, refreshErr := m.refreshAuthForUnauthorizedRetry(execCtx, executor, auth)
+					if refreshErr == nil && refreshed {
+						auth = refreshedAuth
+						retriedAfterUnauthorizedRefresh = true
+						goto retryCountAfterUnauthorizedRefresh
+					}
+					if refreshErr != nil {
+						errExec = refreshErr
+					}
 				}
 				result.Error = &Error{Message: errExec.Error()}
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
@@ -1726,6 +1786,30 @@ func (m *Manager) prepareRequestAuth(ctx context.Context, executor ProviderExecu
 		return saved, nil
 	}
 	return updated, nil
+}
+
+func (m *Manager) refreshAuthForUnauthorizedRetry(ctx context.Context, executor ProviderExecutor, auth *Auth) (*Auth, bool, error) {
+	if m == nil || executor == nil || auth == nil {
+		return auth, false, nil
+	}
+	updated, err := executor.Refresh(ctx, auth.Clone())
+	if err != nil {
+		return auth, false, err
+	}
+	if updated == nil {
+		return auth, false, nil
+	}
+	saved, err := m.Update(ctx, updated)
+	if err != nil {
+		return updated, false, err
+	}
+	if saved != nil {
+		updated = saved
+	}
+	if entry := logEntryWithRequestID(ctx); entry != nil {
+		entry.Infof("auth returned unauthorized; refreshed credential and retrying once | auth=%s provider=%s", updated.ID, updated.Provider)
+	}
+	return updated, true, nil
 }
 
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
