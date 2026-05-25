@@ -7,7 +7,7 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
   if (window.__cpaAuthFileTestUI) return;
   window.__cpaAuthFileTestUI = true;
 
-  var state = { files: [], headers: {}, results: {} };
+  var state = { files: [], headers: {}, results: {}, configYAML: "", configURL: "" };
   var originalFetch = window.fetch;
   if (typeof originalFetch !== "function") return;
 
@@ -38,6 +38,18 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     return /(?:^|\/)(?:v0\/management\/)?auth-files(?:\?|$)/.test(url);
   }
 
+  function isConfigYAML(url) {
+    url = String(url || "").split("#")[0].split("?")[0];
+    return /(?:^|\/)(?:v0\/management\/)?config\.yaml$/.test(url);
+  }
+
+  function rememberConfigYAML(text, url) {
+    if (typeof text !== "string" || text.length < 1) return;
+    state.configYAML = text;
+    state.configURL = String(url || "").split("#")[0].split("?")[0];
+    setTimeout(scanConfigPanel, 50);
+  }
+
   function rememberAuthFiles(data, url) {
     if (data && Array.isArray(data.files)) {
       state.files = data.files;
@@ -54,6 +66,11 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       if (method === "GET" && isAuthFilesList(url)) {
         response.clone().json().then(function (data) {
           rememberAuthFiles(data, url);
+        }).catch(function () {});
+      }
+      if (method === "GET" && isConfigYAML(url)) {
+        response.clone().text().then(function (text) {
+          rememberConfigYAML(text, url);
         }).catch(function () {});
       }
       return response;
@@ -82,6 +99,9 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       this.addEventListener("load", function () {
         if (this.__cpaAuthTestMethod === "GET" && isAuthFilesList(this.__cpaAuthTestURL)) {
           try { rememberAuthFiles(JSON.parse(this.responseText || "{}"), this.__cpaAuthTestURL); } catch (_) {}
+        }
+        if (this.__cpaAuthTestMethod === "GET" && isConfigYAML(this.__cpaAuthTestURL)) {
+          rememberConfigYAML(this.responseText || "", this.__cpaAuthTestURL);
         }
       });
       return originalSend.apply(this, arguments);
@@ -392,17 +412,192 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     });
   }
 
+  function isConfigPage() {
+    var route = String(window.location.pathname || "") + String(window.location.hash || "");
+    if (/\/config(?:[/?#]|$)/.test(route)) return true;
+    var bodyText = norm(document.body && document.body.textContent);
+    return bodyText.indexOf("\u914d\u7f6e\u9762\u677f") !== -1 && bodyText.indexOf("\u53ef\u89c6\u5316\u7f16\u8f91") !== -1;
+  }
+
+  function yamlTimeoutValue(yaml) {
+    var match = String(yaml || "").match(/^codex-response-header-timeout-seconds\s*:\s*(-?\d+)\s*$/m);
+    return match ? match[1] : "180";
+  }
+
+  function upsertTimeoutValue(yaml, value) {
+    yaml = String(yaml || "");
+    var line = "codex-response-header-timeout-seconds: " + value;
+    if (/^codex-response-header-timeout-seconds\s*:/m.test(yaml)) {
+      return yaml.replace(/^codex-response-header-timeout-seconds\s*:.*$/m, line);
+    }
+    if (/^nonstream-keepalive-interval\s*:.*$/m.test(yaml)) {
+      return yaml.replace(/^(nonstream-keepalive-interval\s*:.*)$/m,
+        "$1\n# Codex upstream response-header timeout. Only applies before headers arrive; streaming body remains unlimited.\n" + line);
+    }
+    return line + "\n" + yaml;
+  }
+
+  function configCandidates() {
+    var urls = [];
+    if (state.configURL) urls.push(state.configURL);
+    urls.push("/v0/management/config.yaml");
+    if (window.location && window.location.hostname) {
+      urls.push(window.location.protocol + "//" + window.location.hostname + ":8317/v0/management/config.yaml");
+    }
+    return urls.filter(function (url, index) { return url && urls.indexOf(url) === index; });
+  }
+
+  function loadConfigYAML() {
+    if (state.configYAML) return Promise.resolve(state.configYAML);
+    var headers = Object.assign({}, state.headers);
+    var urls = configCandidates();
+    var attempt = function (index) {
+      if (index >= urls.length) return Promise.reject(new Error("cannot load config.yaml"));
+      return fetchWithTimeout(urls[index], { method: "GET", headers: headers }, 10000).then(function (response) {
+        if (!response.ok) throw new Error("GET " + urls[index] + " returned " + response.status);
+        return response.text().then(function (text) {
+          rememberConfigYAML(text, urls[index]);
+          return text;
+        });
+      }).catch(function () {
+        return attempt(index + 1);
+      });
+    };
+    return attempt(0);
+  }
+
+  function saveConfigYAML(yaml) {
+    var headers = Object.assign({}, state.headers, { "content-type": "application/yaml; charset=utf-8" });
+    var urls = configCandidates();
+    var attempt = function (index) {
+      if (index >= urls.length) return Promise.reject(new Error("cannot save config.yaml"));
+      return fetchWithTimeout(urls[index], { method: "PUT", headers: headers, body: yaml }, 15000).then(function (response) {
+        if (!response.ok) {
+          return response.text().then(function (text) {
+            throw new Error("PUT " + urls[index] + " returned " + response.status + ": " + text);
+          });
+        }
+        rememberConfigYAML(yaml, urls[index]);
+        return response;
+      }).catch(function (error) {
+        if (index + 1 >= urls.length) throw error;
+        return attempt(index + 1);
+      });
+    };
+    return attempt(0);
+  }
+
+  function configAnchor() {
+    var labels = Array.prototype.slice.call(document.querySelectorAll("button,[role='tab'],div,span"))
+      .filter(function (node) { return norm(node.textContent) === "\u53ef\u89c6\u5316\u7f16\u8f91"; });
+    for (var i = 0; i < labels.length; i++) {
+      var parent = labels[i].parentElement;
+      if (parent && parent.parentElement) return parent.parentElement;
+    }
+    return document.querySelector("main") || document.querySelector(".content") || document.body;
+  }
+
+  function statusText(node, text, ok) {
+    if (!node) return;
+    node.textContent = text;
+    node.style.color = ok ? "#047857" : "#b91c1c";
+  }
+
+  function buildConfigTimeoutCard() {
+    var card = document.createElement("div");
+    card.className = "cpa-codex-timeout-card";
+    card.style.cssText = "margin:16px 0;padding:14px 18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;display:grid;grid-template-columns:minmax(220px,1fr) minmax(180px,260px) auto;gap:14px;align-items:center;box-shadow:0 8px 22px rgba(37,99,235,.08);";
+
+    var copy = document.createElement("div");
+    var title = document.createElement("div");
+    title.textContent = "Codex \u54cd\u5e94\u5934\u8d85\u65f6";
+    title.style.cssText = "font-weight:700;color:#0f172a;font-size:14px;line-height:20px;";
+    var hint = document.createElement("div");
+    hint.textContent = "\u53ea\u9650\u5236\u4e0a\u6e38 headers \u524d\u7684\u7b49\u5f85\uff1bheaders \u540e\u7684\u6d41\u5f0f\u601d\u8003\u4e0d\u9650\u65f6\u30020 \u4f7f\u7528\u9ed8\u8ba4 180\uff0c\u8d1f\u6570\u5173\u95ed\u3002";
+    hint.style.cssText = "margin-top:2px;color:#475569;font-size:12px;line-height:18px;";
+    copy.appendChild(title);
+    copy.appendChild(hint);
+
+    var inputWrap = document.createElement("label");
+    inputWrap.style.cssText = "display:flex;flex-direction:column;gap:5px;font-size:12px;font-weight:600;color:#334155;";
+    inputWrap.textContent = "\u79d2";
+    var input = document.createElement("input");
+    input.type = "number";
+    input.className = "cpa-codex-timeout-input";
+    input.value = yamlTimeoutValue(state.configYAML);
+    input.style.cssText = "height:38px;border:1px solid #cbd5e1;border-radius:8px;padding:0 10px;font-size:14px;background:#fff;color:#0f172a;";
+    inputWrap.appendChild(input);
+
+    var actions = document.createElement("div");
+    actions.style.cssText = "display:flex;align-items:center;gap:10px;justify-content:flex-end;flex-wrap:wrap;";
+    var status = document.createElement("span");
+    status.className = "cpa-codex-timeout-status";
+    status.style.cssText = "font-size:12px;min-width:74px;text-align:right;color:#64748b;";
+    var button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "\u4fdd\u5b58";
+    button.style.cssText = "height:38px;padding:0 14px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;";
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      var value = parseInt(input.value, 10);
+      if (!Number.isFinite(value)) {
+        statusText(status, "\u8bf7\u8f93\u5165\u6574\u6570", false);
+        return;
+      }
+      button.disabled = true;
+      button.textContent = "\u4fdd\u5b58\u4e2d";
+      statusText(status, "", true);
+      loadConfigYAML().then(function (yaml) {
+        return saveConfigYAML(upsertTimeoutValue(yaml, String(value)));
+      }).then(function () {
+        statusText(status, "\u5df2\u4fdd\u5b58", true);
+      }).catch(function (error) {
+        statusText(status, "\u4fdd\u5b58\u5931\u8d25", false);
+        showModal("Codex \u54cd\u5e94\u5934\u8d85\u65f6\u4fdd\u5b58\u5931\u8d25", String(error && error.message || error), false);
+      }).finally(function () {
+        button.disabled = false;
+        button.textContent = "\u4fdd\u5b58";
+      });
+    });
+    actions.appendChild(status);
+    actions.appendChild(button);
+
+    card.appendChild(copy);
+    card.appendChild(inputWrap);
+    card.appendChild(actions);
+    return card;
+  }
+
+  function scanConfigPanel() {
+    if (!isConfigPage()) return;
+    var existing = document.querySelector(".cpa-codex-timeout-card");
+    if (existing) {
+      var input = existing.querySelector(".cpa-codex-timeout-input");
+      if (input && document.activeElement !== input) input.value = yamlTimeoutValue(state.configYAML);
+      return;
+    }
+    var anchor = configAnchor();
+    if (!anchor || !anchor.parentElement) return;
+    anchor.parentElement.insertBefore(buildConfigTimeoutCard(), anchor.nextSibling);
+    loadConfigYAML().then(function () { scanConfigPanel(); }).catch(function () {});
+  }
+
   var scanTimer = 0;
   function scheduleScan() {
     if (scanTimer) return;
     scanTimer = setTimeout(function () {
       scanTimer = 0;
       scanRows();
+      scanConfigPanel();
     }, 250);
   }
 
   new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
-  setInterval(scanRows, 2000);
+  setInterval(function () {
+    scanRows();
+    scanConfigPanel();
+  }, 2000);
 })();
 </script>`)
 
