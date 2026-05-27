@@ -503,40 +503,114 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     node.style.color = ok ? "#047857" : "#b91c1c";
   }
 
+  function isVisibleNode(node) {
+    if (!node || !node.getBoundingClientRect) return false;
+    var rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function findConfigTitle(text) {
+    var candidates = Array.prototype.slice.call(document.querySelectorAll("h1,h2,h3,h4,div,span,p"))
+      .filter(function (node) {
+        return norm(node.textContent) === text && isVisibleNode(node);
+      });
+    if (!candidates.length) return null;
+    var contentCandidates = candidates.filter(function (node) {
+      return node.getBoundingClientRect().left > 320;
+    });
+    return (contentCandidates.length ? contentCandidates : candidates)[0];
+  }
+
+  function findNextConfigTitle(afterNode) {
+    if (!afterNode) return null;
+    var afterRect = afterNode.getBoundingClientRect();
+    var titles = ["\u989d\u5ea6\u56de\u9000", "\u6d41\u5f0f\u4f20\u8f93\u914d\u7f6e", "\u6a21\u578b\u914d\u7f6e", "\u4ee3\u7406\u914d\u7f6e"];
+    var matches = [];
+    titles.forEach(function (title) {
+      var node = findConfigTitle(title);
+      if (!node) return;
+      var rect = node.getBoundingClientRect();
+      if (rect.top > afterRect.top || (Math.abs(rect.top - afterRect.top) < 2 && rect.left > afterRect.left)) {
+        matches.push({ node: node, top: rect.top, left: rect.left });
+      }
+    });
+    matches.sort(function (a, b) {
+      if (a.top !== b.top) return a.top - b.top;
+      return a.left - b.left;
+    });
+    return matches.length ? matches[0].node : null;
+  }
+
+  function directChildOf(parent, node) {
+    var child = node;
+    while (child && child.parentElement && child.parentElement !== parent) {
+      child = child.parentElement;
+    }
+    return child && child.parentElement === parent ? child : null;
+  }
+
+  function networkConfigMount() {
+    var networkTitle = findConfigTitle("\u7f51\u7edc\u914d\u7f6e");
+    if (!networkTitle) return null;
+    var nextTitle = findNextConfigTitle(networkTitle);
+    if (nextTitle) {
+      var parent = networkTitle.parentElement;
+      while (parent && parent !== document.body) {
+        if (parent.contains(nextTitle)) {
+          var before = directChildOf(parent, nextTitle);
+          var networkChild = directChildOf(parent, networkTitle);
+          if (before && networkChild && before !== networkChild && parent.getBoundingClientRect().width > 500) {
+            return { parent: parent, before: before };
+          }
+        }
+        parent = parent.parentElement;
+      }
+    }
+    var fallback = networkTitle.parentElement;
+    for (var i = 0; fallback && i < 5; i++) {
+      if (fallback.getBoundingClientRect && fallback.getBoundingClientRect().width > 500) {
+        return { parent: fallback, before: null };
+      }
+      fallback = fallback.parentElement;
+    }
+    return null;
+  }
+
   function buildConfigTimeoutCard() {
     var card = document.createElement("div");
     card.className = "cpa-codex-timeout-card";
-    card.style.cssText = "margin:16px 0;padding:14px 18px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:8px;display:grid;grid-template-columns:minmax(220px,1fr) minmax(180px,260px) auto;gap:14px;align-items:center;box-shadow:0 8px 22px rgba(37,99,235,.08);";
+    card.style.cssText = "margin:12px 0 0;padding:16px 22px;border:1px solid #e2e8f0;background:#fff;border-radius:16px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;";
 
     var copy = document.createElement("div");
+    copy.style.cssText = "min-width:260px;flex:1 1 360px;";
     var title = document.createElement("div");
     title.textContent = "Codex \u54cd\u5e94\u5934\u8d85\u65f6";
-    title.style.cssText = "font-weight:700;color:#0f172a;font-size:14px;line-height:20px;";
+    title.style.cssText = "font-weight:700;color:#111827;font-size:15px;line-height:22px;";
     var hint = document.createElement("div");
     hint.textContent = "\u53ea\u9650\u5236\u4e0a\u6e38 headers \u524d\u7684\u7b49\u5f85\uff1bheaders \u540e\u7684\u6d41\u5f0f\u601d\u8003\u4e0d\u9650\u65f6\u30020 \u4f7f\u7528\u9ed8\u8ba4 180\uff0c\u8d1f\u6570\u5173\u95ed\u3002";
-    hint.style.cssText = "margin-top:2px;color:#475569;font-size:12px;line-height:18px;";
+    hint.style.cssText = "margin-top:4px;color:#4b5563;font-size:13px;line-height:20px;";
     copy.appendChild(title);
     copy.appendChild(hint);
 
     var inputWrap = document.createElement("label");
-    inputWrap.style.cssText = "display:flex;flex-direction:column;gap:5px;font-size:12px;font-weight:600;color:#334155;";
+    inputWrap.style.cssText = "display:flex;flex-direction:column;gap:6px;font-size:13px;font-weight:600;color:#374151;min-width:160px;flex:0 1 220px;";
     inputWrap.textContent = "\u79d2";
     var input = document.createElement("input");
     input.type = "number";
     input.className = "cpa-codex-timeout-input";
     input.value = yamlTimeoutValue(state.configYAML);
-    input.style.cssText = "height:38px;border:1px solid #cbd5e1;border-radius:8px;padding:0 10px;font-size:14px;background:#fff;color:#0f172a;";
+    input.style.cssText = "height:44px;border:1px solid #d1d5db;border-radius:12px;padding:0 14px;font-size:15px;background:#fff;color:#111827;outline:none;";
     inputWrap.appendChild(input);
 
     var actions = document.createElement("div");
-    actions.style.cssText = "display:flex;align-items:center;gap:10px;justify-content:flex-end;flex-wrap:wrap;";
+    actions.style.cssText = "display:flex;align-items:center;gap:10px;justify-content:flex-end;flex:0 0 auto;";
     var status = document.createElement("span");
     status.className = "cpa-codex-timeout-status";
     status.style.cssText = "font-size:12px;min-width:74px;text-align:right;color:#64748b;";
     var button = document.createElement("button");
     button.type = "button";
     button.textContent = "\u4fdd\u5b58";
-    button.style.cssText = "height:38px;padding:0 14px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;";
+    button.style.cssText = "height:44px;padding:0 18px;border:1px solid #2563eb;background:#2563eb;color:#fff;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;";
     button.addEventListener("click", function (event) {
       event.preventDefault();
       event.stopPropagation();
@@ -571,15 +645,18 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
 
   function scanConfigPanel() {
     if (!isConfigPage()) return;
+    var mount = networkConfigMount();
+    if (!mount || !mount.parent) return;
     var existing = document.querySelector(".cpa-codex-timeout-card");
     if (existing) {
       var input = existing.querySelector(".cpa-codex-timeout-input");
       if (input && document.activeElement !== input) input.value = yamlTimeoutValue(state.configYAML);
+      if (existing.parentElement !== mount.parent) {
+        mount.parent.insertBefore(existing, mount.before || null);
+      }
       return;
     }
-    var anchor = configAnchor();
-    if (!anchor || !anchor.parentElement) return;
-    anchor.parentElement.insertBefore(buildConfigTimeoutCard(), anchor.nextSibling);
+    mount.parent.insertBefore(buildConfigTimeoutCard(), mount.before || null);
     loadConfigYAML().then(function () { scanConfigPanel(); }).catch(function () {});
   }
 
