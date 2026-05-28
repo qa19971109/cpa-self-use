@@ -181,6 +181,52 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     return best || card;
   }
 
+  function contextTooLargeMessage(text) {
+    text = String(text || "");
+    return text.indexOf("context_too_large") !== -1 ||
+      text.indexOf("Your input exceeds the context window of this model") !== -1 ||
+      text.indexOf("\u8d85\u8fc7\u4e0a\u4e0b\u6587\u7a97\u53e3") !== -1;
+  }
+
+  function requestClassificationTarget(node) {
+    return node.closest("tr,[role='row'],[class*='request'],[class*='Request'],[class*='log'],[class*='Log'],[class*='card'],[class*='Card']") ||
+      node.parentElement ||
+      node;
+  }
+
+  function addContextTooLargeBadge(target) {
+    if (!target || target.querySelector(".cpa-request-classification-badge")) return;
+    var badge = document.createElement("span");
+    badge.className = "cpa-request-classification-badge";
+    badge.textContent = "\u4e0a\u4e0b\u6587\u8fc7\u957f / \u975e\u8d26\u53f7\u95ee\u9898";
+    badge.title = "Upstream rejected the request because the input exceeded the model context window. Retrying another auth file will not fix the same payload.";
+    badge.style.cssText = "display:inline-flex;align-items:center;margin-left:8px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;line-height:18px;color:#92400e;background:#fef3c7;border:1px solid #f59e0b;white-space:nowrap;";
+
+    var titleLike = Array.prototype.slice.call(target.querySelectorAll("div,span,td,p"))
+      .filter(function (node) {
+        var text = norm(node.textContent);
+        return text && text.length < 220 && !contextTooLargeMessage(text) && !node.querySelector(".cpa-request-classification-badge");
+      })[0];
+    (titleLike || target).appendChild(badge);
+  }
+
+  function scanRequestFailureClassifications() {
+    if (!document.body) return;
+    var nodes = Array.prototype.slice.call(document.querySelectorAll("tr,[role='row'],td,div,span,pre,code,p"))
+      .filter(function (node) {
+        if (node.closest(".cpa-request-classification-badge")) return false;
+        var text = node.textContent || "";
+        if (text.length < 20 || text.length > 20000 || !contextTooLargeMessage(text)) return false;
+        return !Array.prototype.slice.call(node.children || []).some(function (child) {
+          return !child.classList.contains("cpa-request-classification-badge") &&
+            contextTooLargeMessage(child.textContent || "");
+        });
+      });
+    nodes.slice(0, 30).forEach(function (node) {
+      addContextTooLargeBadge(requestClassificationTarget(node));
+    });
+  }
+
   function markAuthResult(card, file, result) {
     if (!card || !file || !result) return;
     var key = fileKey(file);
@@ -666,6 +712,7 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     scanTimer = setTimeout(function () {
       scanTimer = 0;
       scanRows();
+      scanRequestFailureClassifications();
       scanConfigPanel();
     }, 250);
   }
@@ -673,6 +720,7 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
   new MutationObserver(scheduleScan).observe(document.documentElement, { childList: true, subtree: true });
   setInterval(function () {
     scanRows();
+    scanRequestFailureClassifications();
     scanConfigPanel();
   }, 2000);
 })();
