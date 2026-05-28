@@ -188,24 +188,54 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       text.indexOf("\u8d85\u8fc7\u4e0a\u4e0b\u6587\u7a97\u53e3") !== -1;
   }
 
+  function usageLimitReachedMessage(text) {
+    text = String(text || "");
+    return text.indexOf("usage_limit_reached") !== -1 ||
+      text.indexOf("The usage limit has been reached") !== -1 ||
+      text.indexOf("\u4f7f\u7528\u4e0a\u9650") !== -1 ||
+      text.indexOf("\u989d\u5ea6\u7528\u5c3d") !== -1;
+  }
+
+  function requestFailureClassification(text) {
+    if (contextTooLargeMessage(text)) {
+      return {
+        key: "context_too_large",
+        text: "\u4e0a\u4e0b\u6587\u8fc7\u957f / \u975e\u8d26\u53f7\u95ee\u9898",
+        title: "Upstream rejected the request because the input exceeded the model context window. Retrying another auth file will not fix the same payload.",
+        style: "color:#92400e;background:#fef3c7;border:1px solid #f59e0b;"
+      };
+    }
+    if (usageLimitReachedMessage(text)) {
+      return {
+        key: "usage_limit_reached",
+        text: "\u4f7f\u7528\u4e0a\u9650 / \u975e\u8d26\u53f7\u5931\u6548",
+        title: "Upstream reported that this account or plan has reached its usage limit. It is a quota state, not an invalid auth file.",
+        style: "color:#9a3412;background:#ffedd5;border:1px solid #fdba74;"
+      };
+    }
+    return null;
+  }
+
   function requestClassificationTarget(node) {
     return node.closest("tr,[role='row'],[class*='request'],[class*='Request'],[class*='log'],[class*='Log'],[class*='card'],[class*='Card']") ||
       node.parentElement ||
       node;
   }
 
-  function addContextTooLargeBadge(target) {
+  function addRequestClassificationBadge(target, classification) {
     if (!target || target.querySelector(".cpa-request-classification-badge")) return;
+    if (!classification) return;
     var badge = document.createElement("span");
     badge.className = "cpa-request-classification-badge";
-    badge.textContent = "\u4e0a\u4e0b\u6587\u8fc7\u957f / \u975e\u8d26\u53f7\u95ee\u9898";
-    badge.title = "Upstream rejected the request because the input exceeded the model context window. Retrying another auth file will not fix the same payload.";
-    badge.style.cssText = "display:inline-flex;align-items:center;margin-left:8px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;line-height:18px;color:#92400e;background:#fef3c7;border:1px solid #f59e0b;white-space:nowrap;";
+    badge.dataset.cpaClassification = classification.key;
+    badge.textContent = classification.text;
+    badge.title = classification.title;
+    badge.style.cssText = "display:inline-flex;align-items:center;margin-left:8px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;line-height:18px;white-space:nowrap;" + classification.style;
 
     var titleLike = Array.prototype.slice.call(target.querySelectorAll("div,span,td,p"))
       .filter(function (node) {
         var text = norm(node.textContent);
-        return text && text.length < 220 && !contextTooLargeMessage(text) && !node.querySelector(".cpa-request-classification-badge");
+        return text && text.length < 220 && !requestFailureClassification(text) && !node.querySelector(".cpa-request-classification-badge");
       })[0];
     (titleLike || target).appendChild(badge);
   }
@@ -216,15 +246,20 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       .filter(function (node) {
         if (node.closest(".cpa-request-classification-badge")) return false;
         var text = node.textContent || "";
-        if (text.length < 20 || text.length > 20000 || !contextTooLargeMessage(text)) return false;
+        if (text.length < 20 || text.length > 20000 || !requestFailureClassification(text)) return false;
         return !Array.prototype.slice.call(node.children || []).some(function (child) {
           return !child.classList.contains("cpa-request-classification-badge") &&
-            contextTooLargeMessage(child.textContent || "");
+            requestFailureClassification(child.textContent || "");
         });
       });
     nodes.slice(0, 30).forEach(function (node) {
-      addContextTooLargeBadge(requestClassificationTarget(node));
+      addRequestClassificationBadge(requestClassificationTarget(node), requestFailureClassification(node.textContent || ""));
     });
+  }
+
+  function authResultClassification(result) {
+    if (!result || result.ok) return null;
+    return requestFailureClassification(result.error || result.raw_response || result.text || "");
   }
 
   function markAuthResult(card, file, result) {
@@ -237,11 +272,12 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       badge.className = "cpa-auth-validity-badge";
       authStatsTarget(card).appendChild(badge);
     }
-    var text = result.ok ? "\u8d26\u53f7\u6709\u6548" : "\u8d26\u53f7\u5df2\u5931\u6548";
-    var title = result.ok ? "Last model test succeeded" : (result.error || "Last model test failed");
+    var classification = authResultClassification(result);
+    var text = result.ok ? "\u8d26\u53f7\u6709\u6548" : (classification ? classification.text : "\u8d26\u53f7\u5df2\u5931\u6548");
+    var title = result.ok ? "Last model test succeeded" : (classification ? classification.title : (result.error || "Last model test failed"));
     var style = "display:inline-flex;align-items:center;margin-left:10px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;line-height:18px;color:" +
-      (result.ok ? "#047857;background:#dcfce7;border:1px solid #86efac;" : "#b91c1c;background:#fee2e2;border:1px solid #fecaca;");
-    var okValue = result.ok ? "1" : "0";
+      (result.ok ? "#047857;background:#dcfce7;border:1px solid #86efac;" : (classification ? classification.style : "#b91c1c;background:#fee2e2;border:1px solid #fecaca;"));
+    var okValue = result.ok ? "1" : (classification ? classification.key : "0");
     if (badge.dataset.cpaOk === okValue && badge.textContent === text && badge.title === title) return;
     badge.dataset.cpaOk = okValue;
     badge.textContent = text;
