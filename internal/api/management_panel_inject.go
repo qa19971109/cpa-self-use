@@ -257,9 +257,14 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
     });
   }
 
-  function authResultClassification(result) {
+  function authResultClassification(result, card) {
     if (!result || result.ok) return null;
-    return requestFailureClassification(result.error || result.raw_response || result.text || "");
+    return requestFailureClassification([
+      result.error || "",
+      result.raw_response || "",
+      result.text || "",
+      card ? card.textContent || "" : ""
+    ].join("\n"));
   }
 
   function markAuthResult(card, file, result) {
@@ -272,7 +277,7 @@ var managementAuthFileTestScript = []byte(`<script id="cpa-auth-file-test-ui">
       badge.className = "cpa-auth-validity-badge";
       authStatsTarget(card).appendChild(badge);
     }
-    var classification = authResultClassification(result);
+    var classification = authResultClassification(result, card);
     var text = result.ok ? "\u8d26\u53f7\u6709\u6548" : (classification ? classification.text : "\u8d26\u53f7\u5df2\u5931\u6548");
     var title = result.ok ? "Last model test succeeded" : (classification ? classification.title : (result.error || "Last model test failed"));
     var style = "display:inline-flex;align-items:center;margin-left:10px;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;line-height:18px;color:" +
