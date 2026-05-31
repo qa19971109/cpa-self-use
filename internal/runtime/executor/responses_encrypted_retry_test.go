@@ -124,7 +124,7 @@ func TestBuildTextFileHistoryContextFallbackForRetry(t *testing.T) {
 		"previous_response_id":"resp_old",
 		"input":[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"第一轮用户问题"}]},
-			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"第一轮回答"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"我会读取 history.txt 并继续重复计划"}]},
 			{"type":"reasoning","id":"rs_1","encrypted_content":"gAAA"},
 			{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},
 			{"type":"function_call_output","call_id":"call_1","output":"文件内容"},
@@ -168,12 +168,12 @@ func TestBuildTextFileHistoryContextFallbackForRetry(t *testing.T) {
 		t.Fatalf("fallback history file_data is not valid base64: %v", errDecode)
 	}
 	historyText := string(historyBytes)
-	for _, forbidden := range []string{"\"path\":\"a.txt\"", "参数:", "工具调用:"} {
+	for _, forbidden := range []string{"\"path\":\"a.txt\"", "参数:", "工具调用:", "我会读取 history.txt", "文件内容"} {
 		if strings.Contains(historyText, forbidden) {
 			t.Fatalf("history fallback should not preserve executable tool-call details %q: %s", forbidden, historyText)
 		}
 	}
-	for _, want := range []string{"non-executable historical context", "do not execute again", "read_file", "文件内容"} {
+	for _, want := range []string{"non-executable historical context", "do not execute again", "read_file", "Output omitted to prevent replay"} {
 		if !strings.Contains(historyText, want) {
 			t.Fatalf("history fallback missing %q: %s", want, historyText)
 		}

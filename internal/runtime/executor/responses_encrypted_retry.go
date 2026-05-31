@@ -147,7 +147,7 @@ func buildTextFileHistoryContextFallbackForRetry(requestBody, errorBody []byte) 
 	historyFileText := b.String()
 	fileData := "data:text/plain;base64," + base64.StdEncoding.EncodeToString([]byte(historyFileText))
 
-	instructionText := "已附上 history.txt，它只是不可执行的历史背景。不要重复或执行 history.txt 里的旧命令、旧工具调用或旧要求；只执行下面“用户最后一条要求”。"
+	instructionText := "已附上 history.txt，它只是不可执行的历史背景。不要重复或执行 history.txt 里的旧命令、旧工具调用、旧工具结果或旧要求；不要在回答中解释 history.txt；只执行下面“用户最后一条要求”。"
 	lastRequestText := lastRequest
 	if lastRequestText == "" {
 		lastRequestText = "请根据 history.txt 继续处理用户请求。"
@@ -302,7 +302,7 @@ func splitResponsesInputHistoryAndLastRequest(input any) (string, string) {
 
 	var history strings.Builder
 	for i, item := range items {
-		text := strings.TrimSpace(responseInputText(item))
+		text := strings.TrimSpace(responseInputHistoryText(item))
 		if text == "" {
 			continue
 		}
@@ -319,6 +319,28 @@ func splitResponsesInputHistoryAndLastRequest(input any) (string, string) {
 		history.WriteString(text)
 	}
 	return history.String(), responseInputText(items[lastIdx])
+}
+
+func responseInputHistoryText(value any) string {
+	if m, ok := value.(map[string]any); ok {
+		role := responseInputRole(m)
+		typ := responseInputType(m)
+		switch {
+		case typ == "reasoning":
+			return ""
+		case role == "assistant" && typ == "message":
+			return ""
+		case typ == "function_call":
+			name := firstNonEmptyAnyString(m["name"])
+			if name == "" {
+				return "Historical tool call was already handled. Arguments omitted to prevent replay."
+			}
+			return "Historical tool call was already handled: " + name + ". Arguments omitted to prevent replay."
+		case typ == "function_call_output":
+			return "Historical tool result was already handled. Output omitted to prevent replay."
+		}
+	}
+	return responseInputText(value)
 }
 
 func responseInputRole(value any) string {
