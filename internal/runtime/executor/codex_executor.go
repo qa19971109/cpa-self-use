@@ -159,6 +159,15 @@ func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 	return newCodexStatusErr(http.StatusBadRequest, body), true
 }
 
+func codexStreamEventCanStartDownstream(eventType string) bool {
+	switch eventType {
+	case "", "response.created", "response.in_progress":
+		return false
+	default:
+		return true
+	}
+}
+
 func codexTerminalErrorBody(eventData []byte, path string) []byte {
 	errorResult := gjson.GetBytes(eventData, path)
 	if !errorResult.Exists() {
@@ -784,6 +793,56 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, err
 		}
 	}
+	startEncryptedReasoningStreamRetry := func(strippedBody []byte) (*http.Response, error) {
+		retryReq, retryBuildErr := e.cacheHelper(ctx, from, url, req, strippedBody)
+		if retryBuildErr != nil {
+			return nil, retryBuildErr
+		}
+		applyCodexHeaders(retryReq, auth, apiKey, true, e.cfg)
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   retryReq.Header.Clone(),
+			Body:      strippedBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		retryStarted := time.Now()
+		helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted reasoning stream retry upstream request started | model=%s", baseModel)
+		retryResp, retryErr := httpClient.Do(retryReq)
+		if retryErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
+			elapsed := time.Since(retryStarted).Round(time.Millisecond)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled before encrypted reasoning stream retry upstream headers | elapsed=%s err=%v context_err=%v", elapsed, retryErr, ctxErr)
+			} else {
+				helps.LogWithRequestID(ctx).Warnf("codex stream executor: encrypted reasoning stream retry upstream request failed before headers | elapsed=%s err=%v", elapsed, retryErr)
+			}
+			return nil, retryErr
+		}
+		streamHeadersReceivedAt = time.Now()
+		retryHeadersElapsed := streamHeadersReceivedAt.Sub(retryStarted).Round(time.Millisecond)
+		helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted reasoning stream retry upstream headers received | status=%d elapsed=%s", retryResp.StatusCode, retryHeadersElapsed)
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, retryResp.StatusCode, retryResp.Header.Clone())
+		if retryResp.StatusCode < 200 || retryResp.StatusCode >= 300 {
+			retryData, retryReadErr := io.ReadAll(retryResp.Body)
+			if errClose := retryResp.Body.Close(); errClose != nil {
+				log.Errorf("codex executor: close encrypted reasoning stream retry response body error: %v", errClose)
+			}
+			if retryReadErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, retryReadErr)
+				return nil, retryReadErr
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, retryData)
+			helps.LogWithRequestID(ctx).Debugf("request encrypted reasoning stream retry error, error status: %d, error message: %s", retryResp.StatusCode, helps.SummarizeErrorBody(retryResp.Header.Get("Content-Type"), retryData))
+			return nil, newCodexStatusErr(retryResp.StatusCode, retryData)
+		}
+		return retryResp, nil
+	}
+
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -792,24 +851,74 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("codex executor: close response body error: %v", errClose)
 			}
 		}()
+		retriedWithoutEncryptedReasoning := false
+	attempt:
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
 		outputItemsByIndex := make(map[int64][]byte)
 		var outputItemsFallback [][]byte
 		firstUpstreamChunk := false
+		downstreamStarted := false
+		var pendingLines [][]byte
+		sendLine := func(line []byte) bool {
+			translatedLine := bytes.Clone(line)
+			if bytes.HasPrefix(line, dataTag) {
+				data := bytes.TrimSpace(line[5:])
+				if gjson.GetBytes(data, "type").String() == "response.completed" {
+					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
+					translatedLine = append([]byte("data: "), data...)
+				}
+			}
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
+			for i := range chunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding stream chunk | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
+					return false
+				}
+			}
+			return true
+		}
 		for scanner.Scan() {
-			line := scanner.Bytes()
+			line := bytes.Clone(scanner.Bytes())
 			if !firstUpstreamChunk {
 				firstUpstreamChunk = true
 				helps.LogWithRequestID(ctx).Infof("codex stream executor: first upstream stream chunk received | since_headers=%s total_elapsed=%s bytes=%d", time.Since(streamHeadersReceivedAt).Round(time.Millisecond), time.Since(upstreamStarted).Round(time.Millisecond), len(line))
 			}
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			translatedLine := bytes.Clone(line)
 
+			eventType := ""
+			canStartDownstream := false
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
+				eventType = gjson.GetBytes(data, "type").String()
 				if streamErr, ok := codexTerminalStreamContextLengthErr(data); ok {
+					if !downstreamStarted && !retriedWithoutEncryptedReasoning {
+						if strippedBody, changed := stripInvalidEncryptedContentFromResponsesBody(body); changed {
+							helps.LogWithRequestID(ctx).Warn("codex stream executor: terminal stream context error before downstream output; retrying once without encrypted reasoning context")
+							if errClose := httpResp.Body.Close(); errClose != nil {
+								log.Errorf("codex executor: close failed stream response body error: %v", errClose)
+							}
+							retryResp, retryErr := startEncryptedReasoningStreamRetry(strippedBody)
+							if retryErr != nil {
+								helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
+								reporter.PublishFailure(ctx, retryErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: retryErr}:
+								case <-ctx.Done():
+									helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding encrypted reasoning stream retry error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
+								}
+								return
+							}
+							httpResp = retryResp
+							body = strippedBody
+							retriedWithoutEncryptedReasoning = true
+							pendingLines = nil
+							goto attempt
+						}
+					}
 					helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 					reporter.PublishFailure(ctx, streamErr)
 					select {
@@ -819,7 +928,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 					}
 					return
 				}
-				switch gjson.GetBytes(data, "type").String() {
+				switch eventType {
 				case "response.output_item.done":
 					collectCodexOutputItemDone(data, outputItemsByIndex, &outputItemsFallback)
 				case "response.completed":
@@ -827,17 +936,32 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 						reporter.Publish(ctx, detail)
 					}
 					publishCodexImageToolUsage(ctx, reporter, body, data)
-					data = patchCodexCompletedOutput(data, outputItemsByIndex, outputItemsFallback)
-					translatedLine = append([]byte("data: "), data...)
 				}
+				canStartDownstream = codexStreamEventCanStartDownstream(eventType)
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, translatedLine, &param)
-			for i := range chunks {
-				select {
-				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-				case <-ctx.Done():
-					helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding stream chunk | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
+			if !downstreamStarted {
+				pendingLines = append(pendingLines, line)
+				if !canStartDownstream {
+					continue
+				}
+				downstreamStarted = true
+				for _, pendingLine := range pendingLines {
+					if !sendLine(pendingLine) {
+						return
+					}
+				}
+				pendingLines = nil
+				continue
+			}
+
+			if !sendLine(line) {
+				return
+			}
+		}
+		if len(pendingLines) > 0 {
+			for _, pendingLine := range pendingLines {
+				if !sendLine(pendingLine) {
 					return
 				}
 			}
