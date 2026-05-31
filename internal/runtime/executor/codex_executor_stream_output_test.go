@@ -171,10 +171,12 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithoutEncryptedRe
 	}
 
 	var completed []byte
+	var streamPayload bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
 		}
+		streamPayload.Write(chunk.Payload)
 		payload := bytes.TrimSpace(chunk.Payload)
 		if !bytes.HasPrefix(payload, []byte("data:")) {
 			continue
@@ -190,6 +192,9 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithoutEncryptedRe
 	}
 	if strings.Contains(gjson.GetBytes(retryBody, "input").Raw, "encrypted_content") {
 		t.Fatalf("retry input should not contain encrypted_content: %s", string(retryBody))
+	}
+	if strings.Contains(streamPayload.String(), "resp_bad") {
+		t.Fatalf("first failed attempt leaked downstream: %s", streamPayload.String())
 	}
 	if got := gjson.GetBytes(retryBody, "input.0.type").String(); got == "reasoning" {
 		t.Fatalf("retry input should remove encrypted reasoning items: %s", string(retryBody))
@@ -240,10 +245,12 @@ func TestCodexExecutorExecuteStreamRetriesIncompleteBootstrapWithoutReasoningCon
 	}
 
 	var completed []byte
+	var streamPayload bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
 		}
+		streamPayload.Write(chunk.Payload)
 		payload := bytes.TrimSpace(chunk.Payload)
 		if !bytes.HasPrefix(payload, []byte("data:")) {
 			continue
@@ -256,6 +263,9 @@ func TestCodexExecutorExecuteStreamRetriesIncompleteBootstrapWithoutReasoningCon
 
 	if calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+	if strings.Contains(streamPayload.String(), "resp_incomplete") {
+		t.Fatalf("first incomplete attempt leaked downstream: %s", streamPayload.String())
 	}
 	if got := gjson.GetBytes(retryBody, "input.0.type").String(); got == "reasoning" {
 		t.Fatalf("retry input should remove reasoning items: %s", string(retryBody))
@@ -310,10 +320,12 @@ func TestCodexExecutorExecuteStreamRetriesIncompleteBeforeContentDeltaWithoutRea
 	}
 
 	var completed []byte
+	var streamPayload bytes.Buffer
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
 			t.Fatalf("stream chunk error: %v", chunk.Err)
 		}
+		streamPayload.Write(chunk.Payload)
 		payload := bytes.TrimSpace(chunk.Payload)
 		if !bytes.HasPrefix(payload, []byte("data:")) {
 			continue
@@ -326,6 +338,9 @@ func TestCodexExecutorExecuteStreamRetriesIncompleteBeforeContentDeltaWithoutRea
 
 	if calls != 2 {
 		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+	if strings.Contains(streamPayload.String(), "resp_incomplete") {
+		t.Fatalf("first incomplete attempt leaked downstream: %s", streamPayload.String())
 	}
 	if got := gjson.GetBytes(retryBody, "input.0.type").String(); got == "reasoning" {
 		t.Fatalf("retry input should remove reasoning items: %s", string(retryBody))

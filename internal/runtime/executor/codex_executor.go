@@ -160,12 +160,7 @@ func codexTerminalStreamContextLengthErr(eventData []byte) (statusErr, bool) {
 }
 
 func codexStreamEventCanStartDownstream(eventType string) bool {
-	switch eventType {
-	case "", "response.created", "response.in_progress", "response.output_item.added", "response.content_part.added", "response.reasoning_summary_part.added":
-		return false
-	default:
-		return true
-	}
+	return eventType == "response.completed"
 }
 
 func codexTerminalErrorBody(eventData []byte, path string) []byte {
@@ -979,15 +974,32 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				return
 			}
 		}
-		if len(pendingLines) > 0 {
-			for _, pendingLine := range pendingLines {
-				if !sendLine(pendingLine) {
-					return
-				}
-			}
-		}
 		if errScan := scanner.Err(); errScan != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			if !downstreamStarted && !retriedWithoutEncryptedReasoning {
+				if strippedBody, changed := stripReasoningItemsFromResponsesBody(body); changed {
+					helps.LogWithRequestID(ctx).Warn("codex stream executor: stream read failed before downstream output; retrying once without reasoning context")
+					if errClose := httpResp.Body.Close(); errClose != nil {
+						log.Errorf("codex executor: close read-failed stream response body error: %v", errClose)
+					}
+					retryResp, retryErr := startEncryptedReasoningStreamRetry(strippedBody)
+					if retryErr != nil {
+						helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
+						reporter.PublishFailure(ctx, retryErr)
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Err: retryErr}:
+						case <-ctx.Done():
+							helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding read-failed stream retry error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
+						}
+						return
+					}
+					httpResp = retryResp
+					body = strippedBody
+					retriedWithoutEncryptedReasoning = true
+					pendingLines = nil
+					goto attempt
+				}
+			}
 			reporter.PublishFailure(ctx, errScan)
 			helps.LogWithRequestID(ctx).Warnf("codex stream executor: upstream stream read failed | first_chunk=%t total_elapsed=%s err=%v", firstUpstreamChunk, time.Since(upstreamStarted).Round(time.Millisecond), errScan)
 			select {
@@ -1037,6 +1049,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding incomplete stream error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
 			}
 			return
+		}
+		if len(pendingLines) > 0 {
+			for _, pendingLine := range pendingLines {
+				if !sendLine(pendingLine) {
+					return
+				}
+			}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
