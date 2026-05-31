@@ -70,6 +70,30 @@ func codexHeaderTimeout(cfg *config.Config) time.Duration {
 	}
 }
 
+func doCodexRequestWithHeaderTimeout(client *http.Client, req *http.Request, timeout time.Duration) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if req == nil || timeout <= 0 {
+		return client.Do(req)
+	}
+
+	reqCtx, cancel := context.WithCancel(req.Context())
+	timer := time.AfterFunc(timeout, cancel)
+	resp, err := client.Do(req.WithContext(reqCtx))
+	if timer.Stop() {
+		if err != nil {
+			cancel()
+		}
+		return resp, err
+	}
+	cancel()
+	if err != nil && req.Context().Err() == nil {
+		return resp, fmt.Errorf("codex response header timeout after %s: %w", timeout.Round(time.Millisecond), err)
+	}
+	return resp, err
+}
+
 // Streamed Codex responses may emit response.output_item.done events while leaving
 // response.completed.response.output empty. Keep the stream path aligned with the
 // already-patched non-stream path by reconstructing response.output from those items.
@@ -284,7 +308,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 		return nil, err
 	}
 	httpClient := newCodexHTTPClient(ctx, e.cfg, auth)
-	return httpClient.Do(httpReq)
+	return doCodexRequestWithHeaderTimeout(httpClient, httpReq, codexHeaderTimeout(e.cfg))
 }
 
 func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
@@ -359,7 +383,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	})
 	httpClient := newCodexHTTPClient(ctx, e.cfg, auth)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doCodexRequestWithHeaderTimeout(httpClient, httpReq, codexHeaderTimeout(e.cfg))
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -394,7 +418,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
-				retryResp, retryErr := httpClient.Do(retryReq)
+				retryResp, retryErr := doCodexRequestWithHeaderTimeout(httpClient, retryReq, codexHeaderTimeout(e.cfg))
 				if retryErr != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
 					err = retryErr
@@ -564,7 +588,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	})
 	httpClient := newCodexHTTPClient(ctx, e.cfg, auth)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doCodexRequestWithHeaderTimeout(httpClient, httpReq, codexHeaderTimeout(e.cfg))
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
@@ -599,7 +623,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 					AuthType:  authType,
 					AuthValue: authValue,
 				})
-				retryResp, retryErr := httpClient.Do(retryReq)
+				retryResp, retryErr := doCodexRequestWithHeaderTimeout(httpClient, retryReq, codexHeaderTimeout(e.cfg))
 				if retryErr != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
 					err = retryErr
@@ -717,7 +741,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	upstreamStarted := time.Now()
 	helps.LogWithRequestID(ctx).Infof("codex stream executor: upstream request started | model=%s", baseModel)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
+	httpResp, err := doCodexRequestWithHeaderTimeout(httpClient, httpReq, codexHeaderTimeout(e.cfg))
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		elapsed := time.Since(upstreamStarted).Round(time.Millisecond)
@@ -764,7 +788,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				})
 				retryStarted := time.Now()
 				helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted_content retry upstream request started | model=%s", baseModel)
-				retryResp, retryErr := httpClient.Do(retryReq)
+				retryResp, retryErr := doCodexRequestWithHeaderTimeout(httpClient, retryReq, codexHeaderTimeout(e.cfg))
 				if retryErr != nil {
 					helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
 					elapsed := time.Since(retryStarted).Round(time.Millisecond)
@@ -823,7 +847,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		})
 		retryStarted := time.Now()
 		helps.LogWithRequestID(ctx).Infof("codex stream executor: encrypted reasoning stream retry upstream request started | model=%s", baseModel)
-		retryResp, retryErr := httpClient.Do(retryReq)
+		retryResp, retryErr := doCodexRequestWithHeaderTimeout(httpClient, retryReq, codexHeaderTimeout(e.cfg))
 		if retryErr != nil {
 			helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
 			elapsed := time.Since(retryStarted).Round(time.Millisecond)
