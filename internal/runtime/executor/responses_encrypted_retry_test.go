@@ -25,6 +25,26 @@ func TestIsInvalidResponsesEncryptedContentError(t *testing.T) {
 	}
 }
 
+func TestShouldRetryResponsesWithoutEncryptedReasoningForContextTooLarge(t *testing.T) {
+	body := []byte(`{
+		"error":{
+			"code":"context_too_large",
+			"type":"invalid_request_error",
+			"message":"Your input exceeds the context window of this model. Please adjust your input and try again."
+		}
+	}`)
+
+	if !shouldRetryResponsesWithoutEncryptedReasoning(http.StatusBadRequest, body) {
+		t.Fatalf("expected context_too_large to trigger encrypted reasoning fallback")
+	}
+	if !shouldRetryResponsesWithoutEncryptedReasoning(http.StatusRequestEntityTooLarge, body) {
+		t.Fatalf("expected 413 context length response to trigger encrypted reasoning fallback")
+	}
+	if shouldRetryResponsesWithoutEncryptedReasoning(http.StatusInternalServerError, body) {
+		t.Fatalf("non-client context response should not trigger encrypted reasoning fallback")
+	}
+}
+
 func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

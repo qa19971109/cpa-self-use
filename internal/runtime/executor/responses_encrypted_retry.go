@@ -36,6 +36,16 @@ func isInvalidResponsesEncryptedContentError(statusCode int, body []byte) bool {
 	return false
 }
 
+func shouldRetryResponsesWithoutEncryptedReasoning(statusCode int, body []byte) bool {
+	if isInvalidResponsesEncryptedContentError(statusCode, body) {
+		return true
+	}
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusRequestEntityTooLarge {
+		return false
+	}
+	return codexTerminalErrorIsContextLength(body)
+}
+
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {

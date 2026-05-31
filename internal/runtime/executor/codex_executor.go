@@ -358,9 +358,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if isInvalidResponsesEncryptedContentError(httpResp.StatusCode, b) {
+		if shouldRetryResponsesWithoutEncryptedReasoning(httpResp.StatusCode, b) {
 			if strippedBody, changed := stripInvalidEncryptedContentFromResponsesBody(body); changed {
-				helps.LogWithRequestID(ctx).Warn("codex executor: upstream rejected encrypted_content; retrying once without encrypted reasoning context")
+				helps.LogWithRequestID(ctx).Warn("codex executor: retrying once without encrypted reasoning context after upstream request error")
 				retryReq, retryBuildErr := e.cacheHelper(ctx, from, url, req, strippedBody)
 				if retryBuildErr != nil {
 					err = retryBuildErr
@@ -561,9 +561,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		if isInvalidResponsesEncryptedContentError(httpResp.StatusCode, b) {
+		if shouldRetryResponsesWithoutEncryptedReasoning(httpResp.StatusCode, b) {
 			if strippedBody, changed := stripInvalidEncryptedContentFromResponsesBody(body); changed {
-				helps.LogWithRequestID(ctx).Warn("codex compact executor: upstream rejected encrypted_content; retrying once without encrypted reasoning context")
+				helps.LogWithRequestID(ctx).Warn("codex compact executor: retrying once without encrypted reasoning context after upstream request error")
 				retryReq, retryBuildErr := e.cacheHelper(ctx, from, url, req, strippedBody)
 				if retryBuildErr != nil {
 					err = retryBuildErr
@@ -723,9 +723,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		if isInvalidResponsesEncryptedContentError(httpResp.StatusCode, data) {
+		if shouldRetryResponsesWithoutEncryptedReasoning(httpResp.StatusCode, data) {
 			if strippedBody, changed := stripInvalidEncryptedContentFromResponsesBody(body); changed {
-				helps.LogWithRequestID(ctx).Warn("codex stream executor: upstream rejected encrypted_content; retrying once without encrypted reasoning context")
+				helps.LogWithRequestID(ctx).Warn("codex stream executor: retrying once without encrypted reasoning context after upstream request error")
 				retryReq, retryBuildErr := e.cacheHelper(ctx, from, url, req, strippedBody)
 				if retryBuildErr != nil {
 					return nil, retryBuildErr
