@@ -204,6 +204,101 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithoutEncryptedRe
 	}
 }
 
+func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithTextFileHistoryFallback(t *testing.T) {
+	var calls int
+	var reasoningRetryBody []byte
+	var textFallbackBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch calls {
+		case 1:
+			_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_bad_1","status":"failed","error":{"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}` + "\n\n"))
+		case 2:
+			reasoningRetryBody = append([]byte(nil), body...)
+			_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_bad_2","status":"failed","error":{"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}` + "\n\n"))
+		default:
+			textFallbackBody = append([]byte(nil), body...)
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_ok","object":"response","created_at":1775555723,"status":"completed","model":"gpt-5.5","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+
+	result, err := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model: "gpt-5.5",
+		Payload: []byte(`{
+			"model":"gpt-5.5",
+			"previous_response_id":"resp_old",
+			"input":[
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"之前的问题"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"之前的回答"}]},
+				{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"最后的要求"}]}
+			]
+		}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream error: %v", err)
+	}
+
+	var completed []byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		payload := bytes.TrimSpace(chunk.Payload)
+		if !bytes.HasPrefix(payload, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(payload[5:])
+		if gjson.GetBytes(data, "type").String() == "response.completed" {
+			completed = append([]byte(nil), data...)
+		}
+	}
+
+	if calls != 3 {
+		t.Fatalf("upstream calls = %d, want 3", calls)
+	}
+	if strings.Contains(gjson.GetBytes(reasoningRetryBody, "input").Raw, "encrypted_content") {
+		t.Fatalf("reasoning retry input should remove encrypted_content: %s", string(reasoningRetryBody))
+	}
+	if gjson.GetBytes(textFallbackBody, "previous_response_id").Exists() {
+		t.Fatalf("text fallback should remove previous_response_id: %s", string(textFallbackBody))
+	}
+	if gjson.GetBytes(textFallbackBody, "include").Exists() {
+		t.Fatalf("text fallback should remove include: %s", string(textFallbackBody))
+	}
+	if typ := gjson.GetBytes(textFallbackBody, "input.0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("text fallback should attach history as input_file, got %q: %s", typ, string(textFallbackBody))
+	}
+	if filename := gjson.GetBytes(textFallbackBody, "input.0.content.1.filename").String(); filename != "history.txt" {
+		t.Fatalf("text fallback filename = %q, want history.txt; body=%s", filename, string(textFallbackBody))
+	}
+	fileData := gjson.GetBytes(textFallbackBody, "input.0.content.1.file_data").String()
+	if !strings.HasPrefix(fileData, "data:text/plain;base64,") {
+		t.Fatalf("text fallback file_data should be text/plain data URI: %s", fileData)
+	}
+	textInput := gjson.GetBytes(textFallbackBody, "input").Raw
+	for _, want := range []string{"history.txt", "用户最后一条要求", "最后的要求"} {
+		if !strings.Contains(textInput, want) {
+			t.Fatalf("text fallback missing %q: %s", want, textInput)
+		}
+	}
+	if got := gjson.GetBytes(completed, "response.output.0.content.0.text").String(); got != "ok" {
+		t.Fatalf("completed text = %q, want ok; completed=%s", got, string(completed))
+	}
+}
+
 func TestCodexExecutorExecuteStreamRetriesIncompleteBootstrapWithoutReasoningContext(t *testing.T) {
 	var calls int
 	var retryBody []byte

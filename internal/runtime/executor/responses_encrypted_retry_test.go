@@ -116,3 +116,58 @@ func TestStripReasoningContextForRetryAcceptsStreamFailedEvent(t *testing.T) {
 		t.Fatalf("message input should remain, got %q; body=%s", typ, got)
 	}
 }
+
+func TestBuildTextFileHistoryContextFallbackForRetry(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_old",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"第一轮用户问题"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"第一轮回答"}]},
+			{"type":"reasoning","id":"rs_1","encrypted_content":"gAAA"},
+			{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"文件内容"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"最后请修复这个问题"}]}
+		]
+	}`)
+	errBody := []byte(`{"error":{"code":"context_too_large","message":"Your input exceeds the context window of this model."}}`)
+
+	got, changed := buildTextFileHistoryContextFallbackForRetry(raw, errBody)
+	if !changed {
+		t.Fatalf("expected fallback body to be built")
+	}
+	if gjson.GetBytes(got, "previous_response_id").Exists() {
+		t.Fatalf("previous_response_id should be removed: %s", got)
+	}
+	if gjson.GetBytes(got, "include").Exists() {
+		t.Fatalf("include should be removed from text file fallback: %s", got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.content.1.type").String(); typ != "input_file" {
+		t.Fatalf("fallback should attach history as input_file, got %q: %s", typ, got)
+	}
+	if filename := gjson.GetBytes(got, "input.0.content.1.filename").String(); filename != "history.txt" {
+		t.Fatalf("fallback filename = %q, want history.txt; body=%s", filename, got)
+	}
+	fileData := gjson.GetBytes(got, "input.0.content.1.file_data").String()
+	if !strings.HasPrefix(fileData, "data:text/plain;base64,") {
+		t.Fatalf("fallback file_data should be text/plain data URI: %s", fileData)
+	}
+	input := gjson.GetBytes(got, "input").Raw
+	for _, want := range []string{"history.txt", "用户最后一条要求", "最后请修复这个问题"} {
+		if !strings.Contains(input, want) {
+			t.Fatalf("fallback input missing %q: %s", want, input)
+		}
+	}
+	if strings.Contains(input, "encrypted_content") || strings.Contains(input, "gAAA") {
+		t.Fatalf("fallback input should not include encrypted reasoning payload: %s", input)
+	}
+}
+
+func TestBuildTextFileHistoryContextFallbackForRetryIgnoresOtherErrors(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+	errBody := []byte(`{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`)
+
+	if _, changed := buildTextFileHistoryContextFallbackForRetry(raw, errBody); changed {
+		t.Fatalf("non-context error should not build text fallback")
+	}
+}

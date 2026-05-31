@@ -1,5 +1,5 @@
 ARG GO_IMAGE=docker.1ms.run/library/golang:1.26-alpine
-ARG ALPINE_IMAGE=docker.1ms.run/library/alpine:3.23
+ARG ALPINE_IMAGE=golang:1.26-alpine
 ARG GOPROXY=https://goproxy.cn,direct
 ARG ALPINE_REPO=https://mirrors.aliyun.com/alpine
 

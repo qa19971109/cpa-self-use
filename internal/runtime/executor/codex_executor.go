@@ -887,6 +887,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}()
 		retriedWithoutEncryptedReasoning := false
+		retriedWithTextHistoryFallback := false
 	attempt:
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
@@ -951,6 +952,30 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 							httpResp = retryResp
 							body = strippedBody
 							retriedWithoutEncryptedReasoning = true
+							pendingLines = nil
+							goto attempt
+						}
+					}
+					if !downstreamStarted && !retriedWithTextHistoryFallback {
+						if fallbackBody, changed := buildTextFileHistoryContextFallbackForRetry(body, data); changed {
+							helps.LogWithRequestID(ctx).Warn("codex stream executor: terminal context error persisted; retrying once with text file history fallback")
+							if errClose := httpResp.Body.Close(); errClose != nil {
+								log.Errorf("codex executor: close failed stream response body error: %v", errClose)
+							}
+							retryResp, retryErr := startEncryptedReasoningStreamRetry(fallbackBody)
+							if retryErr != nil {
+								helps.RecordAPIResponseError(ctx, e.cfg, retryErr)
+								reporter.PublishFailure(ctx, retryErr)
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Err: retryErr}:
+								case <-ctx.Done():
+									helps.LogWithRequestID(ctx).Warnf("codex stream executor: downstream context canceled while forwarding text history fallback error | total_elapsed=%s context_err=%v", time.Since(upstreamStarted).Round(time.Millisecond), ctx.Err())
+								}
+								return
+							}
+							httpResp = retryResp
+							body = fallbackBody
+							retriedWithTextHistoryFallback = true
 							pendingLines = nil
 							goto attempt
 						}
