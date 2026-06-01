@@ -204,24 +204,12 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithoutEncryptedRe
 	}
 }
 
-func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithCompactInputFallback(t *testing.T) {
+func TestCodexExecutorExecuteStreamSurfacesTerminalContextErrorWithoutFallback(t *testing.T) {
 	var calls int
-	var reasoningRetryBody []byte
-	var compactFallbackBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
 		calls++
 		w.Header().Set("Content-Type", "text/event-stream")
-		switch calls {
-		case 1:
-			_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_bad_1","status":"failed","error":{"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}` + "\n\n"))
-		case 2:
-			reasoningRetryBody = append([]byte(nil), body...)
-			_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_bad_2","status":"failed","error":{"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}` + "\n\n"))
-		default:
-			compactFallbackBody = append([]byte(nil), body...)
-			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_ok","object":"response","created_at":1775555723,"status":"completed","model":"gpt-5.5","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
-		}
+		_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_bad_1","status":"failed","error":{"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again."}}}` + "\n\n"))
 	}))
 	defer server.Close()
 
@@ -237,12 +225,12 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithCompactInputFa
 			"model":"gpt-5.5",
 			"previous_response_id":"resp_old",
 			"input":[
-				{"type":"message","role":"user","content":[{"type":"input_text","text":"之前的问题"}]},
-				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"之前的回答"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"previous question"}]},
+				{"type":"message","role":"assistant","content":[{"type":"output_text","text":"previous answer"}]},
 				{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
 				{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},
-				{"type":"function_call_output","call_id":"call_1","output":"文件内容"},
-				{"type":"message","role":"user","content":[{"type":"input_text","text":"最后的要求"}]}
+				{"type":"function_call_output","call_id":"call_1","output":"file content"},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"last request"}]}
 			]
 		}`),
 	}, cliproxyexecutor.Options{
@@ -253,54 +241,24 @@ func TestCodexExecutorExecuteStreamRetriesTerminalContextErrorWithCompactInputFa
 		t.Fatalf("ExecuteStream error: %v", err)
 	}
 
-	var completed []byte
+	var streamErr error
 	for chunk := range result.Chunks {
 		if chunk.Err != nil {
-			t.Fatalf("stream chunk error: %v", chunk.Err)
-		}
-		payload := bytes.TrimSpace(chunk.Payload)
-		if !bytes.HasPrefix(payload, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(payload[5:])
-		if gjson.GetBytes(data, "type").String() == "response.completed" {
-			completed = append([]byte(nil), data...)
+			streamErr = chunk.Err
+			break
 		}
 	}
 
-	if calls != 3 {
-		t.Fatalf("upstream calls = %d, want 3", calls)
+	if calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", calls)
 	}
-	if strings.Contains(gjson.GetBytes(reasoningRetryBody, "input").Raw, "encrypted_content") {
-		t.Fatalf("reasoning retry input should remove encrypted_content: %s", string(reasoningRetryBody))
+	if streamErr == nil {
+		t.Fatalf("expected terminal context error")
 	}
-	if gjson.GetBytes(compactFallbackBody, "previous_response_id").Exists() {
-		t.Fatalf("compact fallback should remove previous_response_id: %s", string(compactFallbackBody))
-	}
-	if gjson.GetBytes(compactFallbackBody, "include").Exists() {
-		t.Fatalf("compact fallback should remove include: %s", string(compactFallbackBody))
-	}
-	items := gjson.GetBytes(compactFallbackBody, "input").Array()
-	if len(items) != 1 {
-		t.Fatalf("compact fallback should keep only the last user item here, got %d: %s", len(items), string(compactFallbackBody))
-	}
-	if role := gjson.GetBytes(compactFallbackBody, "input.0.role").String(); role != "user" {
-		t.Fatalf("compact fallback role = %q, want user: %s", role, string(compactFallbackBody))
-	}
-	compactInput := gjson.GetBytes(compactFallbackBody, "input").Raw
-	if !strings.Contains(compactInput, "最后的要求") {
-		t.Fatalf("compact fallback missing last user request: %s", compactInput)
-	}
-	for _, forbidden := range []string{"history.txt", "read_file", "a.txt", "文件内容", "之前的回答"} {
-		if strings.Contains(compactInput, forbidden) {
-			t.Fatalf("compact fallback should not keep historical detail %q: %s", forbidden, compactInput)
-		}
-	}
-	if got := gjson.GetBytes(completed, "response.output.0.content.0.text").String(); got != "ok" {
-		t.Fatalf("completed text = %q, want ok; completed=%s", got, string(completed))
+	if got := statusCodeFromTestError(t, streamErr); got != http.StatusBadRequest {
+		t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusBadRequest, streamErr)
 	}
 }
-
 func TestCodexExecutorExecuteStreamRetriesIncompleteBootstrapWithoutReasoningContext(t *testing.T) {
 	var calls int
 	var retryBody []byte

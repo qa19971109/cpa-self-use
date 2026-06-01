@@ -25,7 +25,7 @@ func TestIsInvalidResponsesEncryptedContentError(t *testing.T) {
 	}
 }
 
-func TestShouldRetryResponsesWithoutEncryptedReasoningForContextTooLarge(t *testing.T) {
+func TestShouldRetryResponsesWithoutEncryptedReasoningDoesNotRetryContextTooLarge(t *testing.T) {
 	body := []byte(`{
 		"error":{
 			"code":"context_too_large",
@@ -34,11 +34,11 @@ func TestShouldRetryResponsesWithoutEncryptedReasoningForContextTooLarge(t *test
 		}
 	}`)
 
-	if !shouldRetryResponsesWithoutEncryptedReasoning(http.StatusBadRequest, body) {
-		t.Fatalf("expected context_too_large to trigger encrypted reasoning fallback")
+	if shouldRetryResponsesWithoutEncryptedReasoning(http.StatusBadRequest, body) {
+		t.Fatalf("context_too_large should be surfaced to the client, not retried by CPA")
 	}
-	if !shouldRetryResponsesWithoutEncryptedReasoning(http.StatusRequestEntityTooLarge, body) {
-		t.Fatalf("expected 413 context length response to trigger encrypted reasoning fallback")
+	if shouldRetryResponsesWithoutEncryptedReasoning(http.StatusRequestEntityTooLarge, body) {
+		t.Fatalf("413 context length response should be surfaced to the client, not retried by CPA")
 	}
 	if shouldRetryResponsesWithoutEncryptedReasoning(http.StatusInternalServerError, body) {
 		t.Fatalf("non-client context response should not trigger encrypted reasoning fallback")
@@ -114,66 +114,5 @@ func TestStripReasoningContextForRetryAcceptsStreamFailedEvent(t *testing.T) {
 	}
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
 		t.Fatalf("message input should remain, got %q; body=%s", typ, got)
-	}
-}
-
-func TestBuildCompactInputContextFallbackForRetry(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.5",
-		"previous_response_id":"resp_old",
-		"input":[
-			{"type":"message","role":"developer","content":[{"type":"input_text","text":"保持中文回答"}]},
-			{"type":"message","role":"user","content":[{"type":"input_text","text":"第一轮用户问题"}]},
-			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"我会读取 history.txt 并继续重复计划"}]},
-			{"type":"reasoning","id":"rs_1","encrypted_content":"gAAA"},
-			{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"a.txt\"}"},
-			{"type":"function_call_output","call_id":"call_1","output":"文件内容"},
-			{"type":"message","role":"user","content":[{"type":"input_text","text":"最后请修复这个问题"}]}
-		]
-	}`)
-	errBody := []byte(`{"error":{"code":"context_too_large","message":"Your input exceeds the context window of this model."}}`)
-
-	got, changed := buildCompactInputContextFallbackForRetry(raw, errBody)
-	if !changed {
-		t.Fatalf("expected fallback body to be built")
-	}
-	if gjson.GetBytes(got, "previous_response_id").Exists() {
-		t.Fatalf("previous_response_id should be removed: %s", got)
-	}
-	if gjson.GetBytes(got, "include").Exists() {
-		t.Fatalf("include should be removed from text file fallback: %s", got)
-	}
-	items := gjson.GetBytes(got, "input").Array()
-	if len(items) != 2 {
-		t.Fatalf("fallback should keep developer and last user only, got %d items: %s", len(items), got)
-	}
-	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
-		t.Fatalf("first compact item role = %q, want developer: %s", role, got)
-	}
-	if role := gjson.GetBytes(got, "input.1.role").String(); role != "user" {
-		t.Fatalf("second compact item role = %q, want user: %s", role, got)
-	}
-	input := gjson.GetBytes(got, "input").Raw
-	for _, want := range []string{"保持中文回答", "最后请修复这个问题"} {
-		if !strings.Contains(input, want) {
-			t.Fatalf("fallback input missing %q: %s", want, input)
-		}
-	}
-	if strings.Contains(input, "encrypted_content") || strings.Contains(input, "gAAA") {
-		t.Fatalf("fallback input should not include encrypted reasoning payload: %s", input)
-	}
-	for _, forbidden := range []string{"history.txt", "\"path\":\"a.txt\"", "read_file", "文件内容", "第一轮用户问题"} {
-		if strings.Contains(input, forbidden) {
-			t.Fatalf("compact fallback should not preserve historical detail %q: %s", forbidden, input)
-		}
-	}
-}
-
-func TestBuildCompactInputContextFallbackForRetryIgnoresOtherErrors(t *testing.T) {
-	raw := []byte(`{"model":"gpt-5.5","input":"hello"}`)
-	errBody := []byte(`{"error":{"code":"rate_limit_exceeded","message":"slow down"}}`)
-
-	if _, changed := buildCompactInputContextFallbackForRetry(raw, errBody); changed {
-		t.Fatalf("non-context error should not build compact fallback")
 	}
 }
